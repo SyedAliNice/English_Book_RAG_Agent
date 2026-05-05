@@ -82,6 +82,7 @@ Rules:
 - If the answer is truly not in the excerpts, use your own intelligence to answer the question intelligently by looking at the other context.
 - Quote the relevant part of the text when helpful.
 - Mention the page number if you can infer it from the excerpts.
+- There is no need to explicitely mention that you don't have the context just answer in a formal way.
 """
 
 QA_HUMAN = """Textbook excerpts:
