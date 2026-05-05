@@ -228,12 +228,17 @@ def initialise_rag(pdf_path: str, force_rebuild: bool = False,
 # ── Retrieval ─────────────────────────────────────────────────
 
 def retrieve_context(vectordb: Chroma, query: str, k: int = 6) -> List[Document]:
-    """Standard MMR retrieval — best for specific Q&A questions."""
-    retriever = vectordb.as_retriever(
-        search_type="mmr",
-        search_kwargs={"k": k, "fetch_k": 20},
-    )
-    return retriever.invoke(query)
+    """
+    Retrieval for Q&A questions.
+    Uses similarity_search (not MMR) to avoid the Pydantic/null-chunk
+    crash that MMR triggers when ChromaDB contains empty documents.
+    Filters out any null/empty chunks before returning.
+    """
+    try:
+        raw = vectordb.similarity_search(query, k=k)
+    except Exception:
+        raw = []
+    return [d for d in raw if d.page_content and d.page_content.strip()]
 
 
 def retrieve_unit_context(vectordb: Chroma, unit_number: int) -> List[Document]:
