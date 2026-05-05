@@ -1,19 +1,21 @@
 """
 RAG Engine for Exploring English Grade 3
 =========================================
-Uses EasyOCR instead of Tesseract — pure pip install, no system setup needed.
-
+Uses EasyOCR instead of Tesseract — pure pip install, no system setup.
     pip install easyocr
 
-EasyOCR downloads its model (~100 MB) on first use automatically.
+New in this version:
+  - retrieve_unit_context(): fetches ALL chunks belonging to a specific
+    unit by filtering on page range, used for summary/full-content queries.
+  - retrieve_context(): unchanged MMR retrieval for normal Q&A.
 """
 
 import io
 import re
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
-import fitz                 # PyMuPDF  (pip install pymupdf)
+import fitz
 import numpy as np
 from PIL import Image
 
@@ -28,36 +30,42 @@ except ImportError:
     from langchain_community.vectorstores import Chroma  # type: ignore
 
 
-# ── Constants ────────────────────────────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────
 EMBED_MODEL   = "all-MiniLM-L6-v2"
 CHUNK_SIZE    = 800
 CHUNK_OVERLAP = 150
 PERSIST_DIR   = "chroma_db"
-RENDER_DPI    = 2.0   # 2.0 ≈ 150 DPI — good balance of speed vs quality
+RENDER_DPI    = 2.0
 
-# Unit-heading patterns (digit form, word form, chapter, numbered title)
-_UNIT_PATTERNS = [
-    re.compile(r"Unit\s+\d+",                                          re.IGNORECASE),
-    re.compile(r"Unit\s+(?:One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten)",
-               re.IGNORECASE),
-    re.compile(r"Chapter\s+\d+",                                       re.IGNORECASE),
-    re.compile(r"(?:^|\n)\s*\d+\.\s+[A-Z][A-Za-z ]{4,40}"),
-]
+# ── Hardcoded unit page ranges (start_page, end_page inclusive)
+# Derived from visual inspection of the PDF.
+# These are the BOOK page numbers printed on the pages (not PDF page index).
+UNIT_PAGE_RANGES = {
+    1:  (1,   13),
+    2:  (14,  25),
+    3:  (26,  40),
+    4:  (41,  52),
+    5:  (53,  67),
+    6:  (68,  83),
+    7:  (84,  97),
+    8:  (98,  112),
+    9:  (113, 125),
+    10: (126, 142),
+}
 
 
-# ── EasyOCR singleton (loaded once, reused for all pages) ────────────────────
+# ── EasyOCR singleton ─────────────────────────────────────────
 _easyocr_reader = None
 
 def _get_ocr_reader():
     global _easyocr_reader
     if _easyocr_reader is None:
         import easyocr
-        # gpu=False works on any machine; change to True if you have CUDA
         _easyocr_reader = easyocr.Reader(["en"], gpu=False, verbose=False)
     return _easyocr_reader
 
 
-# ── Embedding Wrapper ─────────────────────────────────────────────────────────
+# ── Embedding wrapper ─────────────────────────────────────────
 
 class DirectSTEmbeddings(Embeddings):
     def __init__(self, model_name: str = EMBED_MODEL):
@@ -80,48 +88,44 @@ def get_embeddings() -> DirectSTEmbeddings:
     return DirectSTEmbeddings(EMBED_MODEL)
 
 
-# ── Page rendering ────────────────────────────────────────────────────────────
+# ── Page rendering ────────────────────────────────────────────
 
 def _render_page(page: fitz.Page, scale: float = RENDER_DPI) -> np.ndarray:
-    """Render a PDF page to a numpy RGB array (what EasyOCR expects)."""
     mat = fitz.Matrix(scale, scale)
     pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
     img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
     return np.array(img)
 
 
-# ── OCR ───────────────────────────────────────────────────────────────────────
-
 def _ocr_page(img_array: np.ndarray) -> str:
-    """Run EasyOCR on a numpy image array and return joined text."""
     reader  = _get_ocr_reader()
     results = reader.readtext(img_array, detail=0, paragraph=True)
     return "\n".join(results)
 
 
-# ── Unit detection ────────────────────────────────────────────────────────────
+# ── Unit detection from OCR text ──────────────────────────────
+_UNIT_PATTERNS = [
+    re.compile(r"Unit\s+\d+",                                         re.IGNORECASE),
+    re.compile(r"Unit\s+(?:One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten)",
+               re.IGNORECASE),
+    re.compile(r"Chapter\s+\d+",                                      re.IGNORECASE),
+]
 
-def _detect_unit(text: str, window: int = 500) -> str | None:
-    snippet = text[:window]
+def _detect_unit(text: str, window: int = 500) -> Optional[str]:
     for pat in _UNIT_PATTERNS:
-        m = pat.search(snippet)
+        m = pat.search(text[:window])
         if m:
-            return m.group(1) if pat.groups else m.group(0)
+            return m.group(0)
     return None
 
 
-# ── PDF Extraction ────────────────────────────────────────────────────────────
+# ── PDF Extraction ────────────────────────────────────────────
 
 def extract_text_from_pdf(pdf_path: str, status_callback=None) -> List[Document]:
-    """
-    Extract text from every page.
-    Tries native PDF text first (fast); falls back to EasyOCR for image-based pages.
-    status_callback(page_num, total) — optional Streamlit progress hook.
-    """
-    doc           = fitz.open(pdf_path)
-    total         = len(doc)
-    documents     = []
-    current_unit  = "Introduction"
+    doc          = fitz.open(pdf_path)
+    total        = len(doc)
+    documents    = []
+    current_unit = "Introduction"
 
     for page_num in range(total):
         if status_callback:
@@ -143,7 +147,6 @@ def extract_text_from_pdf(pdf_path: str, status_callback=None) -> List[Document]
         if detected:
             current_unit = detected
 
-        # Prepend unit label so the LLM sees it inside every retrieved chunk
         labeled_text = f"[{current_unit}]\n{text}"
 
         documents.append(Document(
@@ -159,7 +162,7 @@ def extract_text_from_pdf(pdf_path: str, status_callback=None) -> List[Document]
     return documents
 
 
-# ── Chunking ──────────────────────────────────────────────────────────────────
+# ── Chunking ──────────────────────────────────────────────────
 
 def split_documents(documents: List[Document]) -> List[Document]:
     splitter = RecursiveCharacterTextSplitter(
@@ -171,7 +174,7 @@ def split_documents(documents: List[Document]) -> List[Document]:
     return [c for c in chunks if c.page_content.strip()]
 
 
-# ── Vector Store ──────────────────────────────────────────────────────────────
+# ── Vector Store ──────────────────────────────────────────────
 
 def build_vector_store(chunks: List[Document], persist_dir: str = PERSIST_DIR) -> Chroma:
     embeddings = get_embeddings()
@@ -205,8 +208,6 @@ def vector_store_exists(persist_dir: str = PERSIST_DIR) -> bool:
     return p.exists() and any(p.iterdir())
 
 
-# ── Top-level initialiser ─────────────────────────────────────────────────────
-
 def initialise_rag(pdf_path: str, force_rebuild: bool = False,
                    status_callback=None) -> Chroma:
     if not force_rebuild and vector_store_exists():
@@ -224,11 +225,55 @@ def initialise_rag(pdf_path: str, force_rebuild: bool = False,
     return build_vector_store(chunks)
 
 
-# ── Retrieval ─────────────────────────────────────────────────────────────────
+# ── Retrieval ─────────────────────────────────────────────────
 
 def retrieve_context(vectordb: Chroma, query: str, k: int = 6) -> List[Document]:
+    """Standard MMR retrieval — best for specific Q&A questions."""
     retriever = vectordb.as_retriever(
         search_type="mmr",
         search_kwargs={"k": k, "fetch_k": 20},
     )
     return retriever.invoke(query)
+
+
+def retrieve_unit_context(vectordb: Chroma, unit_number: int) -> List[Document]:
+    """
+    Fetch ALL chunks that belong to a specific unit by filtering on
+    page number. Used when the user asks for a summary or full content
+    of a unit/chapter so we don't miss any part of it.
+    Returns chunks sorted by page number.
+    """
+    page_range = UNIT_PAGE_RANGES.get(unit_number)
+    if not page_range:
+        return []
+
+    start_page, end_page = page_range
+
+    # Pull a large number of docs then filter by page metadata
+    # (ChromaDB where-filter on int range)
+    try:
+        results = vectordb.get(
+            where={"$and": [
+                {"page": {"$gte": start_page}},
+                {"page": {"$lte": end_page}},
+            ]},
+            include=["documents", "metadatas"],
+        )
+        docs = []
+        for text, meta in zip(results["documents"], results["metadatas"]):
+            if text and text.strip():
+                docs.append(Document(page_content=text, metadata=meta))
+        # Sort by page number so the LLM reads in order
+        docs.sort(key=lambda d: d.metadata.get("page", 0))
+        return docs
+    except Exception:
+        # Fallback: use MMR with a high k and rely on metadata filtering
+        all_docs = vectordb.similarity_search(
+            f"unit {unit_number}", k=50
+        )
+        filtered = [
+            d for d in all_docs
+            if start_page <= d.metadata.get("page", 0) <= end_page
+        ]
+        filtered.sort(key=lambda d: d.metadata.get("page", 0))
+        return filtered
