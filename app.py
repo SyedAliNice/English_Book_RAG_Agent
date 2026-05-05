@@ -22,8 +22,11 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-from rag_engine  import initialise_rag, retrieve_context, extract_text_from_pdf, split_documents, build_vector_store, vector_store_exists
+from rag_engine  import initialise_rag, retrieve_context, retrieve_unit_context, \
+                        extract_text_from_pdf, split_documents, build_vector_store, \
+                        vector_store_exists
 from llm_chains  import get_llm, answer_question, answer_exercise, \
+                        detect_unit_summary_request, \
                         generate_exam_paper, generate_answer_key
 
 # ── Styling ───────────────────────────────────────────────────────────────────
@@ -192,11 +195,11 @@ if mode == "💬 Ask a Question":
 
         with st.chat_message("assistant"):
             with st.spinner("Thinking…"):
-                docs = retrieve_context(vectordb, question, k=6)
-                try:
-                    result = answer_question(llm, docs, question)
-                except Exception as e:
-                    result = {"answer": f"⚠️ {e}", "sources": []}
+                # Smart routing: detect summary requests and fetch full unit
+                unit_num  = detect_unit_summary_request(question)
+                unit_docs = retrieve_unit_context(vectordb, unit_num) if unit_num else []
+                docs      = retrieve_context(vectordb, question, k=6)
+                result    = answer_question(llm, docs, question, unit_docs=unit_docs or None)
 
             st.markdown(result["answer"])
             if result["sources"]:
@@ -249,11 +252,8 @@ elif mode == "✏️ Exercise Helper":
         else:
             query = f"[{ex_type}] {exercise_input}" if ex_type != "Auto-detect" else exercise_input
             with st.spinner("Solving…"):
-                docs = retrieve_context(vectordb, query, k=6)
-                try:
-                    result = answer_exercise(llm, docs, query)
-                except Exception as e:
-                    result = {"answer": f"⚠️ {e}", "sources": []}
+                docs   = retrieve_context(vectordb, query, k=6)
+                result = answer_exercise(llm, docs, query)
 
             st.markdown('<div class="answer-box">', unsafe_allow_html=True)
             st.markdown("#### 📘 Answer & Explanation")
