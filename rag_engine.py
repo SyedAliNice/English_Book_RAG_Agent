@@ -192,7 +192,7 @@ def build_vector_store(chunks: List[Document], persist_dir: str = PERSIST_DIR) -
         else:
             vectordb.add_documents(batch)
 
-    vectordb.persist()
+    # vectordb.persist()
     return vectordb
 
 
