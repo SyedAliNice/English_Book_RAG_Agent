@@ -1,17 +1,292 @@
+# """
+# LLM Chains powered by Groq (llama-3.3-70b-versatile).
+
+# Changes vs original:
+#   - Graceful error handling for RateLimitError, AuthenticationError, APIError
+#   - answer_question now returns a fallback dict on any LLM error
+#   - Prompt improved: LLM is told to infer unit names from context clues
+#     (headings, chapter markers) even when the word "Unit N" is absent.
+# """
+
+# from typing import List, Dict
+
+# from langchain_groq import ChatGroq
+# from langchain_core.documents import Document
+# from langchain_core.prompts import ChatPromptTemplate
+
+# try:
+#     from groq import RateLimitError, AuthenticationError, APIError
+# except ImportError:          # older groq versions use a different path
+#     from groq._exceptions import RateLimitError, AuthenticationError, APIError
+
+
+# # ── LLM factory ──────────────────────────────────────────────────────────────
+
+# def get_llm(api_key: str, temperature: float = 0.3) -> ChatGroq:
+#     return ChatGroq(
+#         groq_api_key=api_key,
+#         model_name="llama-3.3-70b-versatile",
+#         temperature=temperature,
+#         max_tokens=4096,   # raised: full-unit summaries need more output tokens
+#     )
+
+
+# # ── Helper ───────────────────────────────────────────────────────────────────
+
+# def format_context(docs: List[Document]) -> str:
+#     parts = []
+#     for i, doc in enumerate(docs, 1):
+#         meta = doc.metadata
+#         parts.append(
+#             f"[Excerpt {i} | Page {meta.get('page','?')} | {meta.get('unit','?')}]\n"
+#             f"{doc.page_content}"
+#         )
+#     return "\n\n---\n\n".join(parts)
+
+
+# def _error_dict(msg: str) -> Dict:
+#     return {"answer": msg, "sources": []}
+
+
+# def _invoke_safe(chain, payload: dict) -> str:
+#     """Invoke a LangChain chain and surface friendly errors on failure."""
+#     try:
+#         result = chain.invoke(payload)
+#         return result.content
+#     except AuthenticationError:
+#         raise ValueError(
+#             "❌ **Invalid Groq API key.** Please check the key you entered in the sidebar "
+#             "and make sure it starts with `gsk_`."
+#         )
+#     except RateLimitError:
+#         raise ValueError(
+#             "⏳ **Groq rate limit reached.** You've hit the free-tier limit. "
+#             "Wait 1–2 minutes and try again, or upgrade your Groq plan."
+#         )
+#     except APIError as e:
+#         raise ValueError(f"🔴 **Groq API error:** {e}")
+
+
+# # ── 1. General Q&A ───────────────────────────────────────────────────────────
+
+# QA_SYSTEM = """You are a helpful and encouraging English teacher for Grade 3 students.
+# Answer questions based ONLY on the provided textbook excerpts from
+# "Exploring English - Grade 3" by Zahid Publications.
+
+# STRICT RULES — follow every one without exception:
+
+# 1. Use ONLY information explicitly present in the excerpts.
+#    Do NOT infer, guess, or reason from a unit title alone.
+#    Do NOT fabricate story details, character names, or plot points.
+
+# 2. SUMMARY / OVERVIEW questions:
+#    When the user asks for a summary or overview of a unit, you will be given
+#    ALL the chunks of that unit in page order.  Write a complete, structured
+#    summary covering: the main story/topic, key characters, important events,
+#    vocabulary highlights, and any exercises or poems included.
+#    Use headings like "## Story", "## Key Characters", "## Exercises" as needed.
+#    Base every sentence on the text in the excerpts.
+
+# 3. SPECIFIC questions (character names, events, fill-in-the-blank, etc.):
+#    Find the exact answer in the excerpts and quote the relevant line.
+#    If the answer is genuinely not in the excerpts, say:
+#    "This detail isn't in the retrieved excerpts — try asking about a specific page."
+#    Never guess.
+
+# 4. The excerpts are OCR-scanned.  Headings may appear as plain capitalised
+#    lines (e.g. "THE DRAWN MATCH") — treat these as unit/chapter titles.
+
+# 5. Keep language clear, simple, and age-appropriate for Grade 3.
+
+# 6. Cite page numbers when using specific information (e.g. "Page 6 says…").
+# """
+
+# QA_HUMAN = """Textbook excerpts (read ALL of them before answering):
+# {context}
+
+# Student's question: {question}
+
+# Instructions:
+# - If this is a SUMMARY request: write a full structured summary from ALL the excerpts above.
+# - If this is a SPECIFIC question: find the exact answer in the excerpts and cite the page.
+# - Do NOT guess or invent any information not present in the excerpts above."""
+
+
+# def answer_question(llm: ChatGroq, context_docs: List[Document], question: str) -> Dict:
+#     prompt = ChatPromptTemplate.from_messages([
+#         ("system", QA_SYSTEM),
+#         ("human",  QA_HUMAN),
+#     ])
+#     chain = prompt | llm
+#     try:
+#         content = _invoke_safe(chain, {
+#             "context":  format_context(context_docs),
+#             "question": question,
+#         })
+#     except ValueError as e:
+#         return _error_dict(str(e))
+
+#     sources = list(dict.fromkeys([
+#         f"Page {d.metadata.get('page','?')} ({d.metadata.get('unit','?')})"
+#         for d in context_docs
+#     ]))
+#     return {"answer": content, "sources": sources}
+
+
+# # ── 2. Exercise Q&A ──────────────────────────────────────────────────────────
+
+# EXERCISE_SYSTEM = """You are an expert Grade 3 English teacher solving textbook exercises.
+# Use the provided excerpts to answer the exercise question accurately.
+
+# Rules:
+# - Fill-in-the-blank: provide the complete sentence with blanks filled.
+# - Matching: list each matched pair clearly.
+# - Grammar: explain the rule briefly before answering.
+# - Comprehension: answer from the passage and cite the line.
+# - Always explain WHY the answer is correct so the student learns.
+# """
+
+# EXERCISE_HUMAN = """Textbook excerpts:
+# {context}
+
+# Exercise question:
+# {question}
+
+# Provide the answer with a brief explanation."""
+
+
+# def answer_exercise(llm: ChatGroq, context_docs: List[Document], question: str) -> Dict:
+#     prompt = ChatPromptTemplate.from_messages([
+#         ("system", EXERCISE_SYSTEM),
+#         ("human",  EXERCISE_HUMAN),
+#     ])
+#     chain = prompt | llm
+#     try:
+#         content = _invoke_safe(chain, {
+#             "context":  format_context(context_docs),
+#             "question": question,
+#         })
+#     except ValueError as e:
+#         return _error_dict(str(e))
+
+#     sources = list(dict.fromkeys([
+#         f"Page {d.metadata.get('page','?')} ({d.metadata.get('unit','?')})"
+#         for d in context_docs
+#     ]))
+#     return {"answer": content, "sources": sources}
+
+
+# # ── 3. Exam Paper Generation ─────────────────────────────────────────────────
+
+# EXAM_SYSTEM = """You are an experienced Grade 3 English exam paper setter.
+# Create a well-structured exam paper from the provided textbook content.
+
+# Formatting rules:
+# - Output in clean Markdown.
+# - Include a header with school name placeholder, subject, grade, date, and total marks.
+# - Organise questions into clearly labelled sections (Q1, Q2, ...).
+# - Every question must have marks allocated (shown in brackets).
+# - Questions must be directly based on the provided textbook excerpts.
+# - Do NOT include an answer key in the exam paper itself.
+# - End with a "Best of Luck!" footer.
+# """
+
+# EXAM_HUMAN = """Textbook content to base the exam on:
+# {context}
+
+# Exam specification:
+# - Total marks: {total_marks}
+# - Difficulty: {difficulty}
+# - Question types to include: {q_types}
+# - Focus topic/unit (if any): {focus}
+
+# Generate the complete exam paper now."""
+
+
+# def generate_exam_paper(
+#     llm: ChatGroq,
+#     context_docs: List[Document],
+#     total_marks: int   = 50,
+#     difficulty: str    = "Medium",
+#     q_types: List[str] = None,
+#     focus: str         = "All units",
+# ) -> str:
+#     if q_types is None:
+#         q_types = [
+#             "Multiple Choice Questions (MCQs)",
+#             "Fill in the Blanks",
+#             "True / False",
+#             "Short Answer Questions",
+#             "Write sentences using the given words",
+#         ]
+
+#     prompt = ChatPromptTemplate.from_messages([
+#         ("system", EXAM_SYSTEM),
+#         ("human",  EXAM_HUMAN),
+#     ])
+#     chain = prompt | llm
+#     try:
+#         return _invoke_safe(chain, {
+#             "context":     format_context(context_docs),
+#             "total_marks": total_marks,
+#             "difficulty":  difficulty,
+#             "q_types":     ", ".join(q_types),
+#             "focus":       focus,
+#         })
+#     except ValueError as e:
+#         return str(e)
+
+
+# # ── 4. Answer Key Generation ─────────────────────────────────────────────────
+
+# ANSWER_KEY_SYSTEM = """You are an experienced Grade 3 English teacher.
+# Given an exam paper and the relevant textbook content, produce a detailed answer key.
+# Format it clearly in Markdown with each question's answer and a brief explanation."""
+
+# ANSWER_KEY_HUMAN = """Textbook content:
+# {context}
+
+# Exam paper:
+# {exam_paper}
+
+# Produce a complete answer key."""
+
+
+# def generate_answer_key(
+#     llm: ChatGroq,
+#     context_docs: List[Document],
+#     exam_paper: str,
+# ) -> str:
+#     prompt = ChatPromptTemplate.from_messages([
+#         ("system", ANSWER_KEY_SYSTEM),
+#         ("human",  ANSWER_KEY_HUMAN),
+#     ])
+#     chain = prompt | llm
+#     try:
+#         return _invoke_safe(chain, {
+#             "context":    format_context(context_docs),
+#             "exam_paper": exam_paper,
+#         })
+#     except ValueError as e:
+#         return str(e)
+
+
+
+
+
 """
 LLM Chains powered by Groq (llama-3.3-70b-versatile).
 
-Key improvements in this version:
-  1. Hardcoded TOC injected into every prompt — unit names always correct.
-  2. Smart query routing:
-       - Summary / "tell me about unit X" → retrieves ALL chunks from that
-         unit using retrieve_unit_context(), not just 6 random chunks.
-       - Normal Q&A → standard MMR retrieval as before.
-  3. Graceful error handling for rate limits / bad API keys.
+FIXED VERSION — key changes vs original:
+  1. Every prompt now includes the FULL unit directory (unit names + page ranges)
+     so the LLM always knows all 10 units and never has to guess.
+  2. QA system prompt strengthened: LLM is explicitly told NOT to say
+     "I don't have the full text" when it has the relevant excerpts.
+  3. answer_question now passes the unit directory into the system prompt.
+  4. Graceful error handling retained from original.
 """
 
-import re
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict
 
 from langchain_groq import ChatGroq
 from langchain_core.documents import Document
@@ -22,106 +297,16 @@ try:
 except ImportError:
     from groq._exceptions import RateLimitError, AuthenticationError, APIError
 
-
-# ══════════════════════════════════════════════════════════════
-# BOOK STRUCTURE — confirmed by visual inspection of the PDF
-# ══════════════════════════════════════════════════════════════
-BOOK_TOC = {
-    1:  ("The Drawn Match",                  1),
-    2:  ("The Joy of Helping Others",       14),
-    3:  ("My Village",                      26),
-    4:  ("Animals Friends (Poem)",          41),
-    5:  ("All are Equal (Article)",         53),
-    6:  ("Hazrat Umar (R.A.)",              68),
-    7:  ("The Uses of Mobile Phones",       84),
-    8:  ("Common Professions in Pakistan",  98),
-    9:  ("Keep Our World Clean (Poem)",    113),
-    10: ("Staying Safe at Home",           126),
-}
-
-TOC_STRING = "\n".join(
-    f"  Unit {num}: {title}  (starts at page {page})"
-    for num, (title, page) in BOOK_TOC.items()
-)
-
-BOOK_CONTEXT = f"""
-COMPLETE TABLE OF CONTENTS — Exploring English Grade 3 (Zahid Publications):
-{TOC_STRING}
-
-RULES about this book:
-- Each section is called a "Unit", NOT a "Chapter". "Chapter N" = "Unit N".
-- Each Unit has exactly ONE title (shown above). Use that exact title always.
-- For unit/chapter NAME questions, use the TOC — never say "not in excerpts".
-""".strip()
+# Import the unit directory from rag_engine so prompts stay in sync
+try:
+    from rag_engine import get_all_units_summary, UNIT_PAGE_MAP
+except ImportError:
+    # Fallback if rag_engine not importable yet
+    get_all_units_summary = lambda: "(unit list unavailable)"
+    UNIT_PAGE_MAP = []
 
 
-# ══════════════════════════════════════════════════════════════
-# SMART QUERY ROUTER
-# Detects whether the question is asking for a full unit
-# summary/overview and which unit number it refers to.
-# ══════════════════════════════════════════════════════════════
-
-# Patterns that signal "give me the full content of a unit"
-_SUMMARY_TRIGGERS = re.compile(
-    r"\b(summar|overview|about|explain|describe|what (is|was|happen|are)|"
-    r"tell me|brief|detail|content|story|main (idea|point|topic))\b",
-    re.IGNORECASE,
-)
-
-# Patterns to extract a unit/chapter number from the question
-_UNIT_NUMBER_PATTERNS = [
-    re.compile(r"\b(?:unit|chapter|ch\.?)\s*(\d+)\b", re.IGNORECASE),
-    re.compile(
-        r"\b(?:unit|chapter|ch\.?)\s+"
-        r"(one|two|three|four|five|six|seven|eight|nine|ten)\b",
-        re.IGNORECASE,
-    ),
-]
-_WORD_TO_NUM = {
-    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
-}
-
-# Also match unit titles directly in the question
-_TITLE_TO_UNIT = {
-    title.lower(): num for num, (title, _) in BOOK_TOC.items()
-}
-
-
-def detect_unit_summary_request(question: str) -> Optional[int]:
-    """
-    Returns the unit number if the question is asking for a full
-    summary / content of a specific unit. Returns None otherwise.
-    """
-    q = question.lower()
-
-    # Must have at least one summary-trigger word
-    if not _SUMMARY_TRIGGERS.search(q):
-        return None
-
-    # Try to find a unit number
-    for pat in _UNIT_NUMBER_PATTERNS:
-        m = pat.search(question)
-        if m:
-            raw = m.group(1)
-            if raw.isdigit():
-                n = int(raw)
-            else:
-                n = _WORD_TO_NUM.get(raw.lower(), 0)
-            if 1 <= n <= 10:
-                return n
-
-    # Try matching a unit title mentioned in the question
-    for title_lower, num in _TITLE_TO_UNIT.items():
-        if title_lower in q:
-            return num
-
-    return None
-
-
-# ══════════════════════════════════════════════════════════════
-# LLM FACTORY
-# ══════════════════════════════════════════════════════════════
+# ── LLM factory ───────────────────────────────────────────────────────────────
 
 def get_llm(api_key: str, temperature: float = 0.3) -> ChatGroq:
     return ChatGroq(
@@ -132,13 +317,9 @@ def get_llm(api_key: str, temperature: float = 0.3) -> ChatGroq:
     )
 
 
-# ══════════════════════════════════════════════════════════════
-# HELPERS
-# ══════════════════════════════════════════════════════════════
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def format_context(docs: List[Document]) -> str:
-    if not docs:
-        return "(No excerpts retrieved)"
     parts = []
     for i, doc in enumerate(docs, 1):
         meta = doc.metadata
@@ -155,43 +336,42 @@ def _error_dict(msg: str) -> Dict:
 
 def _invoke_safe(chain, payload: dict) -> str:
     try:
-        return chain.invoke(payload).content
+        result = chain.invoke(payload)
+        return result.content
     except AuthenticationError:
         raise ValueError(
-            "❌ **Invalid Groq API key.** Check the key in the sidebar (starts with `gsk_`)."
+            "❌ **Invalid Groq API key.** Please check the key you entered in the sidebar "
+            "and make sure it starts with `gsk_`."
         )
     except RateLimitError:
         raise ValueError(
-            "⏳ **Groq rate limit reached.** Wait 1–2 minutes then try again."
+            "⏳ **Groq rate limit reached.** You've hit the free-tier limit. "
+            "Wait 1–2 minutes and try again, or upgrade your Groq plan."
         )
     except APIError as e:
         raise ValueError(f"🔴 **Groq API error:** {e}")
 
 
-def _make_sources(docs: List[Document]) -> List[str]:
-    return list(dict.fromkeys([
-        f"Page {d.metadata.get('page','?')} ({d.metadata.get('unit','?')})"
-        for d in docs
-    ]))
+# ── 1. General Q&A ────────────────────────────────────────────────────────────
 
+QA_SYSTEM = """You are a knowledgeable and encouraging English teacher for Grade 3 students.
+You are answering questions about the textbook "Exploring English - Grade 3" by Zahid Publications.
 
-# ══════════════════════════════════════════════════════════════
-# 1. GENERAL Q&A  (with smart summary routing)
-# ══════════════════════════════════════════════════════════════
+TEXTBOOK STRUCTURE — memorise this, it is ground truth:
+{unit_directory}
 
-QA_SYSTEM = """You are a helpful and encouraging English teacher for Grade 3 students.
-You are answering questions about "Exploring English - Grade 3" by Zahid Publications.
-
-{book_context}
-
-Answer rules:
-- For unit/chapter NAME questions: use the TOC above — never say "not in excerpts".
-- For summary / "what is unit X about" questions: a full set of excerpts from
-  that unit has been provided — write a proper, detailed summary from them.
-- For other content questions: use the provided excerpts.
-- Keep answers clear, simple, and age-appropriate.
-- Mention the page number when helpful.
-- "Chapter N" and "Unit N" are the same thing in this book.
+RULES:
+1. Answer ONLY from the provided excerpts. Do not invent content.
+2. The excerpts include a header like [Unit X: Title | pages N–M | Page P].
+   Use this to identify which unit each excerpt belongs to.
+3. When asked for a unit summary or content, synthesise from ALL excerpts that 
+   belong to that unit — do not say "I only have pages X and Y". 
+   Instead say "Based on the excerpts from this unit..."
+4. Never say "I don't have the full text" or "Unfortunately we don't have excerpts" 
+   if ANY excerpt from that unit is present. Work with what you have.
+5. Keep answers clear, simple, and age-appropriate (Grade 3 level).
+6. Always mention the unit title and relevant page numbers in your answer.
+7. Quote relevant parts of the text when helpful.
 """
 
 QA_HUMAN = """Textbook excerpts:
@@ -199,101 +379,60 @@ QA_HUMAN = """Textbook excerpts:
 
 Student's question: {question}
 
-Please answer clearly and helpfully."""
-
-SUMMARY_SYSTEM = """You are a helpful Grade 3 English teacher.
-You have been given ALL the text content from a specific unit of
-"Exploring English - Grade 3" by Zahid Publications.
-
-{book_context}
-
-Your task: write a clear, well-structured summary of the unit.
-Include:
-  • The unit title and number
-  • The main story / topic of the unit
-  • Key characters (if any) and what happens to them
-  • Important grammar or vocabulary topics covered
-  • The moral or lesson of the unit (if applicable)
-
-Keep the language simple and suitable for Grade 3 students and their parents.
-Do NOT say the excerpts are missing or incomplete — you have the full unit.
-"""
-
-SUMMARY_HUMAN = """Full content of the unit (all pages, in order):
-{context}
-
-Question: {question}
-
-Write a complete summary based on the content above."""
+Answer clearly and helpfully using the excerpts above."""
 
 
-def answer_question(
-    llm: ChatGroq,
-    context_docs: List[Document],
-    question: str,
-    unit_docs: Optional[List[Document]] = None,
-) -> Dict:
-    """
-    unit_docs: if provided (non-empty), the question is a unit-summary
-    request and we use the SUMMARY prompt with the full unit content.
-    Otherwise we use the normal QA prompt.
-    """
-    if unit_docs:
-        # ── SUMMARY path ─────────────────────────────────────
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", SUMMARY_SYSTEM),
-            ("human",  SUMMARY_HUMAN),
-        ])
-        docs_to_use = unit_docs
-    else:
-        # ── Normal Q&A path ───────────────────────────────────
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", QA_SYSTEM),
-            ("human",  QA_HUMAN),
-        ])
-        docs_to_use = context_docs
-
+def answer_question(llm: ChatGroq, context_docs: List[Document], question: str) -> Dict:
+    unit_dir = get_all_units_summary()
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", QA_SYSTEM),
+        ("human",  QA_HUMAN),
+    ])
     chain = prompt | llm
     try:
         content = _invoke_safe(chain, {
-            "book_context": BOOK_CONTEXT,
-            "context":      format_context(docs_to_use),
-            "question":     question,
+            "unit_directory": unit_dir,
+            "context":        format_context(context_docs),
+            "question":       question,
         })
     except ValueError as e:
         return _error_dict(str(e))
 
-    return {"answer": content, "sources": _make_sources(docs_to_use)}
+    sources = list(dict.fromkeys([
+        f"Page {d.metadata.get('page','?')} ({d.metadata.get('unit','?')})"
+        for d in context_docs
+    ]))
+    return {"answer": content, "sources": sources}
 
 
-# ══════════════════════════════════════════════════════════════
-# 2. EXERCISE HELPER
-# ══════════════════════════════════════════════════════════════
+# ── 2. Exercise Q&A ───────────────────────────────────────────────────────────
 
 EXERCISE_SYSTEM = """You are an expert Grade 3 English teacher solving textbook exercises.
-You are working with "Exploring English - Grade 3" by Zahid Publications.
+Use the provided excerpts from "Exploring English - Grade 3" (Zahid Publications) to answer
+the exercise question accurately.
 
-{book_context}
+TEXTBOOK STRUCTURE:
+{unit_directory}
 
-Rules:
-- Fill-in-the-blank: give the complete sentence with blanks filled.
+RULES:
+- Fill-in-the-blank: provide the complete sentence with blanks filled.
 - Matching: list each matched pair clearly.
 - Grammar: explain the rule briefly before answering.
-- Comprehension: answer from the passage and cite the relevant line.
-- Always explain WHY the answer is correct.
-- "Chapter N" and "Unit N" are the same in this book.
+- Comprehension: answer from the passage and cite the line.
+- Always explain WHY the answer is correct so the student learns.
 """
 
 EXERCISE_HUMAN = """Textbook excerpts:
 {context}
 
-Exercise:
+Exercise question:
 {question}
 
 Provide the answer with a brief explanation."""
 
 
 def answer_exercise(llm: ChatGroq, context_docs: List[Document], question: str) -> Dict:
+    unit_dir = get_all_units_summary()
     prompt = ChatPromptTemplate.from_messages([
         ("system", EXERCISE_SYSTEM),
         ("human",  EXERCISE_HUMAN),
@@ -301,60 +440,68 @@ def answer_exercise(llm: ChatGroq, context_docs: List[Document], question: str) 
     chain = prompt | llm
     try:
         content = _invoke_safe(chain, {
-            "book_context": BOOK_CONTEXT,
-            "context":      format_context(context_docs),
-            "question":     question,
+            "unit_directory": unit_dir,
+            "context":        format_context(context_docs),
+            "question":       question,
         })
     except ValueError as e:
         return _error_dict(str(e))
-    return {"answer": content, "sources": _make_sources(context_docs)}
+
+    sources = list(dict.fromkeys([
+        f"Page {d.metadata.get('page','?')} ({d.metadata.get('unit','?')})"
+        for d in context_docs
+    ]))
+    return {"answer": content, "sources": sources}
 
 
-# ══════════════════════════════════════════════════════════════
-# 3. EXAM PAPER GENERATOR
-# ══════════════════════════════════════════════════════════════
+# ── 3. Exam Paper Generation ──────────────────────────────────────────────────
 
 EXAM_SYSTEM = """You are an experienced Grade 3 English exam paper setter.
-You are creating an exam for "Exploring English - Grade 3" by Zahid Publications.
+Create a well-structured exam paper from the provided textbook content.
 
-{book_context}
+TEXTBOOK STRUCTURE:
+{unit_directory}
 
-Formatting rules:
+FORMATTING RULES:
 - Output in clean Markdown.
-- Header: school name placeholder, subject, grade, date, total marks.
-- Sections labelled Q1, Q2, … with marks in brackets.
-- Base questions directly on the provided excerpts and the unit TOC.
-- Do NOT include an answer key in the paper.
-- End with "Best of Luck!".
-- Use "Unit N" consistently (not "Chapter N").
+- Include a header with school name placeholder, subject, grade, date, and total marks.
+- Organise questions into clearly labelled sections (Q1, Q2, ...).
+- Every question must have marks allocated (shown in brackets).
+- Questions must be directly based on the provided textbook excerpts.
+- Do NOT include an answer key in the exam paper itself.
+- End with a "Best of Luck!" footer.
 """
 
-EXAM_HUMAN = """Textbook excerpts:
+EXAM_HUMAN = """Textbook content to base the exam on:
 {context}
 
-Exam spec:
+Exam specification:
 - Total marks: {total_marks}
 - Difficulty: {difficulty}
-- Question types: {q_types}
-- Focus: {focus}
+- Question types to include: {q_types}
+- Focus topic/unit (if any): {focus}
 
-Generate the complete exam paper."""
+Generate the complete exam paper now."""
 
 
 def generate_exam_paper(
     llm: ChatGroq,
     context_docs: List[Document],
-    total_marks: int   = 50,
-    difficulty: str    = "Medium",
+    total_marks: int = 50,
+    difficulty: str = "Medium",
     q_types: List[str] = None,
-    focus: str         = "All units",
+    focus: str = "All units",
 ) -> str:
     if q_types is None:
         q_types = [
-            "Multiple Choice Questions (MCQs)", "Fill in the Blanks",
-            "True / False", "Short Answer Questions",
+            "Multiple Choice Questions (MCQs)",
+            "Fill in the Blanks",
+            "True / False",
+            "Short Answer Questions",
             "Write sentences using the given words",
         ]
+
+    unit_dir = get_all_units_summary()
     prompt = ChatPromptTemplate.from_messages([
         ("system", EXAM_SYSTEM),
         ("human",  EXAM_HUMAN),
@@ -362,26 +509,25 @@ def generate_exam_paper(
     chain = prompt | llm
     try:
         return _invoke_safe(chain, {
-            "book_context": BOOK_CONTEXT,
-            "context":      format_context(context_docs),
-            "total_marks":  total_marks,
-            "difficulty":   difficulty,
-            "q_types":      ", ".join(q_types),
-            "focus":        focus,
+            "unit_directory": unit_dir,
+            "context":        format_context(context_docs),
+            "total_marks":    total_marks,
+            "difficulty":     difficulty,
+            "q_types":        ", ".join(q_types),
+            "focus":          focus,
         })
     except ValueError as e:
         return str(e)
 
 
-# ══════════════════════════════════════════════════════════════
-# 4. ANSWER KEY GENERATOR
-# ══════════════════════════════════════════════════════════════
+# ── 4. Answer Key Generation ──────────────────────────────────────────────────
 
 ANSWER_KEY_SYSTEM = """You are an experienced Grade 3 English teacher.
-Produce a detailed answer key for the given exam paper.
-Format in Markdown — answer + brief explanation per question.
+Given an exam paper and the relevant textbook content, produce a detailed answer key.
+Format it clearly in Markdown with each question's answer and a brief explanation.
 
-{book_context}
+TEXTBOOK STRUCTURE:
+{unit_directory}
 """
 
 ANSWER_KEY_HUMAN = """Textbook content:
@@ -390,7 +536,7 @@ ANSWER_KEY_HUMAN = """Textbook content:
 Exam paper:
 {exam_paper}
 
-Produce the complete answer key."""
+Produce a complete answer key."""
 
 
 def generate_answer_key(
@@ -398,6 +544,7 @@ def generate_answer_key(
     context_docs: List[Document],
     exam_paper: str,
 ) -> str:
+    unit_dir = get_all_units_summary()
     prompt = ChatPromptTemplate.from_messages([
         ("system", ANSWER_KEY_SYSTEM),
         ("human",  ANSWER_KEY_HUMAN),
@@ -405,9 +552,9 @@ def generate_answer_key(
     chain = prompt | llm
     try:
         return _invoke_safe(chain, {
-            "book_context": BOOK_CONTEXT,
-            "context":      format_context(context_docs),
-            "exam_paper":   exam_paper,
+            "unit_directory": unit_dir,
+            "context":        format_context(context_docs),
+            "exam_paper":     exam_paper,
         })
     except ValueError as e:
         return str(e)
