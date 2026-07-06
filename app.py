@@ -25,6 +25,7 @@ st.set_page_config(
 from rag_engine  import initialise_rag, retrieve_context, extract_text_from_pdf, split_documents, build_vector_store, vector_store_exists
 from llm_chains  import get_llm, answer_question, answer_exercise, \
                         generate_exam_paper, generate_answer_key
+from urdu_translator import get_gemini_model, translate_to_urdu, is_urdu_translation_available
 
 # ── Styling ───────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -78,6 +79,22 @@ with st.sidebar:
         "📄 PDF Path", value="english_3.pdf",
         help="Path to the textbook PDF (same folder as app.py)",
     )
+
+    st.divider()
+    st.markdown("## 🌐 Urdu Translation (optional)")
+    gemini_api_key = st.text_input(
+        "🔑 Gemini API Key", type="password", placeholder="AIza…",
+        help="Get your free key at aistudio.google.com/apikey",
+    )
+    show_urdu = st.checkbox(
+        "🇵🇰 Also show Urdu translation",
+        value=False,
+        help="Every answer is generated in English by Groq first, then translated "
+             "to Urdu by Gemini — tone and grammar are handled intelligently.",
+        disabled=not is_urdu_translation_available(gemini_api_key),
+    )
+    if show_urdu and not is_urdu_translation_available(gemini_api_key):
+        st.caption("⬆️ Enter a Gemini API key above to enable Urdu translation.")
 
     st.divider()
     mode = st.radio(
@@ -161,6 +178,30 @@ if rebuild:
 vectordb = load_rag(pdf_path, rebuild)
 llm      = get_llm(groq_api_key)
 
+# Cache the Gemini model handle so we don't re-configure the SDK on every rerun
+gemini_model = None
+if is_urdu_translation_available(gemini_api_key):
+    if (
+        "gemini_model" not in st.session_state
+        or st.session_state.get("gemini_key_cached") != gemini_api_key
+    ):
+        st.session_state.gemini_model = get_gemini_model(gemini_api_key)
+        st.session_state.gemini_key_cached = gemini_api_key
+    gemini_model = st.session_state.gemini_model
+
+
+def show_urdu_translation(english_text: str):
+    """Render an Urdu translation block below an English answer, if enabled."""
+    if not (show_urdu and gemini_model and english_text):
+        return
+    with st.spinner("🌐 Translating to Urdu…"):
+        urdu_text = translate_to_urdu(gemini_model, english_text)
+    st.markdown("---")
+    st.markdown("#### 🇵🇰 اردو ترجمہ")
+    st.markdown(f'<div dir="rtl" style="text-align:right; font-size:1.05rem; '
+                f'line-height:2.1;">{urdu_text}</div>', unsafe_allow_html=True)
+
+
 st.success("✅ Textbook indexed and ready!", icon="🎉")
 st.divider()
 
@@ -205,6 +246,8 @@ if mode == "💬 Ask a Question":
                     for s in result["sources"]
                 )
                 st.markdown(f"**Sources:** {source_html}", unsafe_allow_html=True)
+
+            show_urdu_translation(result["answer"])
 
             st.session_state.chat_history.append(
                 {"role": "assistant", "content": result["answer"]}
@@ -266,6 +309,8 @@ elif mode == "✏️ Exercise Helper":
                 st.markdown(f"**Sources:** {source_html}", unsafe_allow_html=True)
             st.markdown("</div>", unsafe_allow_html=True)
 
+            show_urdu_translation(result["answer"])
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MODE 3: Exam Paper Generator
@@ -323,6 +368,8 @@ elif mode == "📝 Exam Paper Generator":
                 file_name="exam_paper_grade3_english.txt", mime="text/plain",
             )
 
+            show_urdu_translation(paper)
+
             if include_answer_key:
                 st.markdown("---")
                 with st.spinner("🗝️ Generating answer key…"):
@@ -335,5 +382,6 @@ elif mode == "📝 Exam Paper Generator":
                         file_name="answer_key_grade3_english.txt",
                         mime="text/plain", key="dl_key",
                     )
+                    show_urdu_translation(key)
 
             st.success("✅ Exam paper ready!", icon="🎉")
